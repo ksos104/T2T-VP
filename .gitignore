@@ -1,5 +1,7 @@
 __pycache__
-results/
+results_*
 *.npy
 *.npz
 *.gz
+.*
+slurm_log/

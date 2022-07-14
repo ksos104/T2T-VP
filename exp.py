@@ -1,4 +1,5 @@
 
+from http import client
 import os
 import os.path as osp
 import json
@@ -11,6 +12,15 @@ from tqdm import tqdm
 from API import *
 from utils import *
 
+from t2t_vit.models.t2t_vit import *
+from t2t_vit.utils import load_t2t_module, load_for_transfer_learning
+
+import neptune.new as neptune
+
+npt = neptune.init(
+    project="kaist-cilab/Nowcasting",
+    api_token="eyJhcGlfYWRkcmVzcyI6Imh0dHBzOi8vYXBwLm5lcHR1bmUuYWkiLCJhcGlfdXJsIjoiaHR0cHM6Ly9hcHAubmVwdHVuZS5haSIsImFwaV9rZXkiOiI4OTQ2MGY0Yi0zMTM2LTQ5ZmEtYjlmOS1lNmQxMTliOTE0MjkifQ=="
+)
 
 class Exp:
     def __init__(self, args):
@@ -60,9 +70,19 @@ class Exp:
         self._build_model()
 
     def _build_model(self):
-        args = self.args
-        self.model = SimVP(tuple(args.in_shape), args.hid_S,
-                           args.hid_T, args.N_S, args.N_T).to(self.device)
+        # args = self.args
+        # self.model = SimVP(tuple(args.in_shape), args.hid_S,
+        #                    args.hid_T, args.N_S, args.N_T).to(self.device)
+
+        self.model = t2t_vit_t_14(img_size=64, in_chans=1).to(self.device)
+        '''🔥Pretrained model load 해결 필요 (input image의 channel이 다름)🔥'''
+        # load_for_transfer_learning(self.model, 't2t_vit/pretrained/81.7_T2T_ViTt_14.pth.tar', use_ema=True, strict=False)
+        
+        ## T2T Module만 load ##
+        # load_t2t_module(self.model, 't2t_vit/pretrained/81.7_T2T_ViTt_14.pth.tar')
+        # for name, parameter in self.model.named_parameters():
+        #     if 'tokens_to_token' in name:
+        #         parameter.requires_grad_(False)
 
     def _get_data(self):
         config = self.args.__dict__
@@ -109,6 +129,7 @@ class Exp:
                 self.scheduler.step()
 
             train_loss = np.average(train_loss)
+            npt["train/loss"].log(train_loss)
 
             if epoch % args.log_step == 0:
                 with torch.no_grad():
@@ -117,6 +138,7 @@ class Exp:
                         self._save(name=str(epoch))
                 print_log("Epoch: {0} | Train Loss: {1:.4f} Vali Loss: {2:.4f}\n".format(
                     epoch + 1, train_loss, vali_loss))
+                npt["valid/loss"].log(vali_loss)
                 recorder(vali_loss, self.model, self.path)
 
         best_model_path = self.path + '/' + 'checkpoint.pth'
@@ -146,6 +168,10 @@ class Exp:
         trues = np.concatenate(trues_lst, axis=0)
         mse, mae, ssim, psnr = metric(preds, trues, vali_loader.dataset.mean, vali_loader.dataset.std, True)
         print_log('vali mse:{:.4f}, mae:{:.4f}, ssim:{:.4f}, psnr:{:.4f}'.format(mse, mae, ssim, psnr))
+        npt["valid/mse"].log(mse)
+        npt["valid/mae"].log(mae)
+        npt["valid/ssim"].log(ssim)
+        npt["valid/psnr"].log(psnr)
         self.model.train()
         return total_loss
 
@@ -166,6 +192,10 @@ class Exp:
 
         mse, mae, ssim, psnr = metric(preds, trues, self.test_loader.dataset.mean, self.test_loader.dataset.std, True)
         print_log('mse:{:.4f}, mae:{:.4f}, ssim:{:.4f}, psnr:{:.4f}'.format(mse, mae, ssim, psnr))
+        npt["test/mse"].log(mse)
+        npt["test/mae"].log(mae)
+        npt["test/ssim"].log(ssim)
+        npt["test/psnr"].log(psnr)
 
         for np_data in ['inputs', 'trues', 'preds']:
             np.save(osp.join(folder_path, np_data + '.npy'), vars()[np_data])

@@ -1,0 +1,360 @@
+# Copyright (c) [2012]-[2021] Shanghai Yitu Technology Co., Ltd.
+#
+# This source code is licensed under the Clear BSD License
+# LICENSE file in the root directory of this file
+# All rights reserved.
+"""
+T2T-TimeSformer
+"""
+import torch
+import torch.nn as nn
+
+from timm.models.helpers import load_pretrained
+from timm.models.registry import register_model
+from timm.models.layers import trunc_normal_
+import numpy as np
+from .token_transformer import Token_transformer
+from .token_performer import Token_performer
+from .timesformer_block import Block, get_sinusoid_encoding
+
+import einops
+
+def _cfg(url='', **kwargs):
+    return {
+        'url': url,
+        'num_classes': 1000, 'input_size': (3, 224, 224), 'pool_size': None,
+        'crop_pct': .9, 'interpolation': 'bicubic',
+        'mean': (0.485, 0.456, 0.406), 'std': (0.229, 0.224, 0.225),
+        'classifier': 'head',
+        **kwargs
+    }
+
+default_cfgs = {
+    't2t_times_7': _cfg(),
+    't2t_times_10': _cfg(),
+    't2t_times_12': _cfg(),
+    't2t_times_14': _cfg(),
+    't2t_times_19': _cfg(),
+    't2t_times_24': _cfg(),
+    't2t_times_t_14': _cfg(),
+    't2t_times_t_19': _cfg(),
+    't2t_times_t_24': _cfg(),
+    't2t_times_14_resnext': _cfg(),
+    't2t_times_14_wide': _cfg(),
+}
+
+class T2T_module(nn.Module):
+    """
+    Tokens-to-Token encoding module
+    """
+    def __init__(self, img_size=224, tokens_type='performer', in_chans=3, embed_dim=768, token_dim=64):
+        super().__init__()
+
+        if tokens_type == 'transformer':
+            print('adopt transformer encoder for tokens-to-token')
+            self.soft_split0 = nn.Unfold(kernel_size=(7, 7), stride=(4, 4), padding=(2, 2))
+            self.soft_split1 = nn.Unfold(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+            self.soft_split2 = nn.Unfold(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+
+            self.attention1 = Token_transformer(dim=in_chans * 7 * 7, in_dim=token_dim, num_heads=1, mlp_ratio=1.0)
+            self.attention2 = Token_transformer(dim=token_dim * 3 * 3, in_dim=token_dim, num_heads=1, mlp_ratio=1.0)
+            self.project = nn.Linear(token_dim * 3 * 3, embed_dim)
+
+        elif tokens_type == 'performer':
+            print('adopt performer encoder for tokens-to-token')
+            self.soft_split0 = nn.Unfold(kernel_size=(7, 7), stride=(4, 4), padding=(2, 2))
+            self.soft_split1 = nn.Unfold(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+            self.soft_split2 = nn.Unfold(kernel_size=(3, 3), stride=(2, 2), padding=(1, 1))
+
+            #self.attention1 = Token_performer(dim=token_dim, in_dim=in_chans*7*7, kernel_ratio=0.5)
+            #self.attention2 = Token_performer(dim=token_dim, in_dim=token_dim*3*3, kernel_ratio=0.5)
+            self.attention1 = Token_performer(dim=in_chans*7*7, in_dim=token_dim, kernel_ratio=0.5)
+            self.attention2 = Token_performer(dim=token_dim*3*3, in_dim=token_dim, kernel_ratio=0.5)
+            self.project = nn.Linear(token_dim * 3 * 3, embed_dim)
+
+        elif tokens_type == 'convolution':  # just for comparison with conolution, not our model
+            # for this tokens type, you need change forward as three convolution operation
+            print('adopt convolution layers for tokens-to-token')
+            self.soft_split0 = nn.Conv2d(3, token_dim, kernel_size=(7, 7), stride=(4, 4), padding=(2, 2))  # the 1st convolution
+            self.soft_split1 = nn.Conv2d(token_dim, token_dim, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)) # the 2nd convolution
+            self.project = nn.Conv2d(token_dim, embed_dim, kernel_size=(3, 3), stride=(2, 2), padding=(1, 1)) # the 3rd convolution
+
+        self.num_patches = (img_size // (4 * 2 * 2)) * (img_size // (4 * 2 * 2))  # there are 3 soft split, stride are 4,2,2 seperately
+
+    def forward(self, x):
+        bs, fn, _, _, _ = x.shape
+        x = einops.rearrange(x, 'bs fn c h w -> (bs fn) c h w')
+
+        # step0: soft split
+        x = self.soft_split0(x).transpose(1, 2)
+
+        # iteration1: re-structurization/reconstruction
+        x = self.attention1(x)
+        B, new_HW, C = x.shape
+        x = x.transpose(1,2).reshape(B, C, int(np.sqrt(new_HW)), int(np.sqrt(new_HW)))
+        # iteration1: soft split
+        x = self.soft_split1(x).transpose(1, 2)
+
+        # iteration2: re-structurization/reconstruction
+        x = self.attention2(x)
+        B, new_HW, C = x.shape
+        x = x.transpose(1, 2).reshape(B, C, int(np.sqrt(new_HW)), int(np.sqrt(new_HW)))
+        # iteration2: soft split
+        x = self.soft_split2(x).transpose(1, 2)
+
+        # final tokens
+        x = self.project(x)
+
+        x = einops.rearrange(x, '(bs fn) d tl -> bs fn d tl', bs=bs, fn=fn)
+
+        return x
+
+
+class T2T_TimeS(nn.Module):
+    def __init__(self, img_size=224, tokens_type='performer', in_chans=3, num_classes=1000, embed_dim=768, depth=12,
+                 num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
+                 drop_path_rate=0., norm_layer=nn.LayerNorm, token_dim=64):
+        super().__init__()
+        self.num_classes = num_classes
+        self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
+
+        self.tokens_to_token = T2T_module(
+                img_size=img_size, tokens_type=tokens_type, in_chans=in_chans, embed_dim=embed_dim, token_dim=token_dim)
+        num_patches = self.tokens_to_token.num_patches
+
+        self.T = 16
+
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(data=get_sinusoid_encoding(n_position=num_patches + 1, d_hid=embed_dim), requires_grad=False)
+        # self.pos_embed = nn.Parameter(data=get_sinusoid_encoding(n_position=num_patches, d_hid=embed_dim).unsqueeze(1), requires_grad=False)
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        self.time_embed = nn.Parameter(data=get_sinusoid_encoding(n_position=self.T, d_hid=embed_dim), requires_grad=False)
+        self.time_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+
+        # Classifier head
+        self.head = nn.Linear(self.T*embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        # self.head = nn.Linear(num_patches*embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        trunc_normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights)
+
+        i = 0
+        for m in self.blocks.modules():
+            m_str = str(m)
+            if 'Block' in m_str:
+                if i > 0:
+                    nn.init.constant_(m.temporal_fc.weight, 0)
+                    nn.init.constant_(m.temporal_fc.bias, 0)
+                i += 1
+
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        return {'cls_token'}
+
+    def get_classifier(self):
+        return self.head
+
+    def reset_classifier(self, num_classes, global_pool=''):
+        self.num_classes = num_classes
+        self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+
+    def forward_features(self, x):
+        '''
+            transformer input dimention: t (b n+1) d  -->  성능 낮음
+        '''
+        '''
+            transformer input dimention: (b n) t+1 d
+        '''
+        # B, T = x.shape[:2]
+        # x = self.tokens_to_token(x)     ## x.shape = [B, T, N, D], N: n_patch, D: dim_embed
+        # N, D = x.shape[-2:]
+
+        # # cls_tokens = self.cls_token.expand(B, T, -1)
+        # # x = torch.cat((cls_tokens, x), dim=1)
+        # x = x + self.pos_embed
+        # x = self.pos_drop(x)
+        
+        # x = einops.rearrange(x, 'b t n d -> (b n) t d')
+        # cls_tokens = self.cls_token.expand(B*N, -1, -1)
+        # x = torch.cat((cls_tokens, x), dim=1)           ## x.shape = [B*N, T+1, D]
+
+        # for blk in self.blocks:
+        #     x = blk(x)
+
+        # x = self.norm(x)
+        # x = einops.rearrange(x, '(b n) f d -> b f n d', b=B, n=N, f=T+1)
+        # x = x[:, 0, :, :]
+        # x = einops.rearrange(x, 'b n d -> b (n d)')
+
+        # return x
+
+        '''
+            transformer input dimention: (b t) n+1 d
+        '''
+        B, T = x.shape[:2]
+        x = self.tokens_to_token(x)     ## x.shape = [B, T, N, D], N: n_patch, D: dim_embed
+        N, D = x.shape[-2:]
+
+        x = einops.rearrange(x, 'b t n d -> (b t) n d')
+
+        cls_tokens = self.cls_token.expand(B*T, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        
+        for blk in self.blocks:
+            x = blk(x)
+
+        x = self.norm(x)
+        x = einops.rearrange(x, '(b t) n d -> b t n d', b=B, t=T)
+        x = x[:,:,0,:]
+        x = einops.rearrange(x, 'b t d -> b (t d)')
+
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
+
+
+@register_model
+def t2t_times_7(pretrained=False, **kwargs): # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 256 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=256, depth=7, num_heads=4, mlp_ratio=2., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_7']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_10(pretrained=False, **kwargs): # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 256 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=256, depth=10, num_heads=4, mlp_ratio=2., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_10']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_12(pretrained=False, **kwargs): # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 256 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=256, depth=12, num_heads=4, mlp_ratio=2., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_12']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+
+@register_model
+def t2t_times_14(pretrained=False, **kwargs):  # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 384 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=384, depth=14, num_heads=6, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_14']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_19(pretrained=False, **kwargs): # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 448 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=448, depth=19, num_heads=7, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_19']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_24(pretrained=False, **kwargs): # adopt performer for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 512 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=512, depth=24, num_heads=8, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_24']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_t_14(pretrained=False, **kwargs):  # adopt transformers for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 384 ** -0.5)
+    model = T2T_TimeS(tokens_type='transformer', embed_dim=384, depth=14, num_heads=6, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_t_14']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_t_19(pretrained=False, **kwargs):  # adopt transformers for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 448 ** -0.5)
+    model = T2T_TimeS(tokens_type='transformer', embed_dim=448, depth=19, num_heads=7, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_t_19']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_t_24(pretrained=False, **kwargs):  # adopt transformers for tokens to token
+    if pretrained:
+        kwargs.setdefault('qk_scale', 512 ** -0.5)
+    model = T2T_TimeS(tokens_type='transformer', embed_dim=512, depth=24, num_heads=8, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_t_24']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+# rexnext and wide structure
+@register_model
+def t2t_times_14_resnext(pretrained=False, **kwargs):
+    if pretrained:
+        kwargs.setdefault('qk_scale', 384 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=384, depth=14, num_heads=32, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_14_resnext']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
+
+@register_model
+def t2t_times_14_wide(pretrained=False, **kwargs):
+    if pretrained:
+        kwargs.setdefault('qk_scale', 512 ** -0.5)
+    model = T2T_TimeS(tokens_type='performer', embed_dim=768, depth=4, num_heads=12, mlp_ratio=3., **kwargs)
+    model.default_cfg = default_cfgs['t2t_times_14_wide']
+    if pretrained:
+        load_pretrained(
+            model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+    return model
