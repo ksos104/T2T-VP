@@ -23,12 +23,12 @@ def create_parser():
     parser.add_argument('--num_workers', default=8, type=int)
 
     # model parameters
-    parser.add_argument('--in_shape', default=[10, 1, 64, 64], type=int,nargs='*') # [10, 1, 64, 64] for mmnist, [4, 2, 32, 32] for taxibj  
-    parser.add_argument('--hid_S', default=64, type=int)
-    parser.add_argument('--hid_T', default=256, type=int)
-    parser.add_argument('--N_S', default=4, type=int)
-    parser.add_argument('--N_T', default=8, type=int)
-    parser.add_argument('--groups', default=4, type=int)
+    # parser.add_argument('--in_shape', default=[10, 1, 64, 64], type=int,nargs='*') # [10, 1, 64, 64] for mmnist, [4, 2, 32, 32] for taxibj  
+    # parser.add_argument('--hid_S', default=64, type=int)
+    # parser.add_argument('--hid_T', default=256, type=int)
+    # parser.add_argument('--N_S', default=4, type=int)
+    # parser.add_argument('--N_T', default=8, type=int)
+    # parser.add_argument('--groups', default=4, type=int)
 
     # Training parameters
     parser.add_argument('--epochs', default=51, type=int)

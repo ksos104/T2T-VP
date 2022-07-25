@@ -5,3 +5,4 @@ results_*
 *.gz
 .*
 slurm_log/
+vis_result/

@@ -70,19 +70,13 @@ class Exp:
         self._build_model()
 
     def _build_model(self):
+        ## SimVP 모델 사용
         # args = self.args
         # self.model = SimVP(tuple(args.in_shape), args.hid_S,
         #                    args.hid_T, args.N_S, args.N_T).to(self.device)
 
+        ## T2T-VP 모델 사용
         self.model = t2t_vit_t_14(img_size=64, in_chans=1).to(self.device)
-        '''🔥Pretrained model load 해결 필요 (input image의 channel이 다름)🔥'''
-        # load_for_transfer_learning(self.model, 't2t_vit/pretrained/81.7_T2T_ViTt_14.pth.tar', use_ema=True, strict=False)
-        
-        ## T2T Module만 load ##
-        # load_t2t_module(self.model, 't2t_vit/pretrained/81.7_T2T_ViTt_14.pth.tar')
-        # for name, parameter in self.model.named_parameters():
-        #     if 'tokens_to_token' in name:
-        #         parameter.requires_grad_(False)
 
     def _get_data(self):
         config = self.args.__dict__
