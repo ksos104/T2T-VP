@@ -15,6 +15,8 @@ from utils import *
 from t2t_vit.models.t2t_vit import *
 from t2t_vit.utils import load_t2t_module, load_for_transfer_learning
 
+from vst.VST import VST
+
 import neptune.new as neptune
 
 npt = neptune.init(
@@ -28,6 +30,7 @@ class Exp:
         self.args = args
         self.config = self.args.__dict__
         self.device = self._acquire_device()
+        # self.device = 'cuda'
 
         self._preparation()
         print_log(output_namespace(self.args))
@@ -70,13 +73,18 @@ class Exp:
         self._build_model()
 
     def _build_model(self):
-        ## SimVP 모델 사용
-        # args = self.args
-        # self.model = SimVP(tuple(args.in_shape), args.hid_S,
-        #                    args.hid_T, args.N_S, args.N_T).to(self.device)
+        args = self.args
 
+        ## SimVP 모델 사용
+        if args.model == 'simvp':
+            self.model = SimVP(tuple(args.in_shape), args.hid_S,
+                            args.hid_T, args.N_S, args.N_T).to(self.device)
         ## T2T-VP 모델 사용
-        self.model = t2t_vit_t_14(img_size=64, in_chans=1).to(self.device)
+        elif args.model == 't2tvp':
+            self.model = t2t_vit_t_14(img_size=64, in_chans=1).to(self.device)
+        ## VST 모델 사용
+        elif args.model == 'vst':
+            self.model = VST(args).to(self.device)
 
     def _get_data(self):
         config = self.args.__dict__
@@ -112,9 +120,12 @@ class Exp:
             for batch_x, batch_y in train_pbar:
                 self.optimizer.zero_grad()
                 batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-                pred_y = self.model(batch_x)
+                recon, pred_y = self.model(batch_x)
+                recon, pred_y = recon[-1].unsqueeze(dim=2), pred_y[-1].unsqueeze(dim=2)
 
-                loss = self.criterion(pred_y, batch_y)
+                loss_recon = self.criterion(recon, batch_x)
+                loss_pred = self.criterion(pred_y, batch_y)
+                loss = 0.1 * loss_recon + loss_pred
                 train_loss.append(loss.item())
                 train_pbar.set_description('train loss: {:.4f}'.format(loss.item()))
 
@@ -148,11 +159,14 @@ class Exp:
                 break
 
             batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
-            pred_y = self.model(batch_x)
+            recon, pred_y = self.model(batch_x)
+            recon, pred_y = recon[-1].unsqueeze(dim=2), pred_y[-1].unsqueeze(dim=2)
             list(map(lambda data, lst: lst.append(data.detach().cpu().numpy()), [
                  pred_y, batch_y], [preds_lst, trues_lst]))
 
-            loss = self.criterion(pred_y, batch_y)
+            loss_recon = self.criterion(recon, batch_x)
+            loss_pred = self.criterion(pred_y, batch_y)
+            loss = 0.1 * loss_recon + loss_pred
             vali_pbar.set_description(
                 'vali loss: {:.4f}'.format(loss.mean().item()))
             total_loss.append(loss.mean().item())
@@ -173,7 +187,8 @@ class Exp:
         self.model.eval()
         inputs_lst, trues_lst, preds_lst = [], [], []
         for batch_x, batch_y in self.test_loader:
-            pred_y = self.model(batch_x.to(self.device))
+            recon, pred_y = self.model(batch_x.to(self.device))
+            recon, pred_y = recon[-1].unsqueeze(dim=2), pred_y[-1].unsqueeze(dim=2)
             list(map(lambda data, lst: lst.append(data.detach().cpu().numpy()), [
                  batch_x, batch_y, pred_y], [inputs_lst, trues_lst, preds_lst]))
 

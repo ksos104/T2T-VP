@@ -131,7 +131,8 @@ class MovingMNIST(data.Dataset):
 
         input = images[:self.n_frames_input]
         if self.n_frames_output > 0:
-            output = images[self.n_frames_input:length]
+            # output = images[self.n_frames_input:length]
+            output = images[1:11]
         else:
             output = []
 

@@ -6,4 +6,4 @@
 #SBATCH -e slurm_log/%j_err.txt
 #SBATCH --gres=gpu
 
-python main.py
+CUDA_VISIBLE_DEVICES=0 python main.py
